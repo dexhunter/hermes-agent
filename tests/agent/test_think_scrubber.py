@@ -189,3 +189,59 @@ class TestRealisticStreaming:
         s = StreamingThinkScrubber()
         deltas = ["Hello ", "world ", "how ", "are ", "you?"]
         assert _drive(s, deltas) == "Hello world how are you?"
+
+
+class TestTagFreeFastPath:
+    """Deltas without '<' take a zero-copy fast path.
+
+    Every tag, partial-tag prefix, and orphan close starts with '<',
+    so a delta with no '<' (and no carried-over scrubber state) can be
+    emitted verbatim without lowering or scanning the buffer.  These
+    tests pin both the optimization property (same object out) and the
+    state bookkeeping the fast path must still perform.
+    """
+
+    def test_tag_free_delta_returns_same_object(self) -> None:
+        """The fast path must not copy: the exact input object comes back."""
+        s = StreamingThinkScrubber()
+        delta = "plain prose with no angle brackets at all\n"
+        assert s.feed(delta) is delta
+
+    def test_fast_path_updates_block_boundary_flag(self) -> None:
+        """A tag-free mid-line delta must still mark the line as dirty.
+
+        If the fast path forgot to update ``_last_emitted_ended_newline``,
+        a following '<think>' at delta position 0 would look like a
+        stream-start boundary and swallow prose as reasoning.
+        """
+        s = StreamingThinkScrubber()
+        assert s.feed("mid-line prose") == "mid-line prose"
+        # Mid-line open tag is a mention, not a block opener.
+        assert _drive(s, ["<think> is an element name"]) == (
+            "<think> is an element name"
+        )
+
+    def test_fast_path_newline_delta_arms_boundary(self) -> None:
+        """A tag-free delta ending in newline re-arms boundary gating."""
+        s = StreamingThinkScrubber()
+        assert s.feed("first line\n") == "first line\n"
+        assert (
+            _drive(s, ["<think>", "hidden reasoning", "</think>", "Visible"])
+            == "Visible"
+        )
+
+    def test_tag_free_delta_after_held_partial_is_not_fast_pathed(self) -> None:
+        """Held-back '<thin' + tag-free delta must resolve through the buffer."""
+        s = StreamingThinkScrubber()
+        assert s.feed("word<thin") == "word"  # '<thin' held back
+        # 'king is fun' has no '<', but the held tail must be re-examined.
+        assert s.feed("king is fun") == "<thinking is fun"
+
+    def test_case_insensitive_close_after_fast_path_deltas(self) -> None:
+        """Mixed-case tags still match after interleaved fast-path deltas."""
+        s = StreamingThinkScrubber()
+        out = _drive(
+            s,
+            ["intro line\n", "<THINK>", "secret", "</Think>", "answer"],
+        )
+        assert out == "intro line\nanswer"
